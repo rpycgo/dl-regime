@@ -13,10 +13,13 @@ dependencies = [
     "python-dateutil>=2.9.0.post0",
     "pyyaml>=6.0.3",
     "scikit-learn>=1.8.0",
-    "torch>=2.6.0",
+    "torch==2.6.0",
 ]
 
 [[tool.uv.index]]
 name = "pytorch-cu124"
 url = "https://download.pytorch.org/whl/cu124"
 explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu124" }
