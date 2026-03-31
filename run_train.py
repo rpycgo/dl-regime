@@ -4,16 +4,21 @@ run_train.py
 CLI entry-point for DL regime model walk-forward training.
 
 Trains LSTM / TCN / Transformer via expanding-window WFA and saves
-per-window checkpoints to ``checkpoints/<model>/<window>/model.ckpt``.
+per-window checkpoints to ``checkpoints/<model>/<window>/model.ckpt``
+and regime_prob predictions to ``results/<model>_predictions.csv``.
+
 All experiments are tracked in MLflow (``mlruns/``).
+
+Signal generation and backtesting are handled downstream by the
+quant-research backtesting module.
 
 Usage
 -----
 ::
 
     python run_train.py --model lstm
-    python run_train.py --model tcn  --csv data/btcusdt_1m.csv
-    python run_train.py --model transformer --start 2024-01-01 --end 2026-01-31
+    python run_train.py --model tcn  --csv data/btcusdt_5m.csv
+    python run_train.py --model transformer --horizon 12 --threshold 0.003
 """
 from __future__ import annotations
 
@@ -32,9 +37,8 @@ sys.path.insert(0, str(_ROOT / "src"))
 from dl_regime import get_default_config_path
 from dl_regime.trainer.wfa_trainer import WfaTrainer
 
+from mdrs_sde import get_default_config_path as mdrs_config_path
 from mdrs_sde.data.preprocessor import Preprocessor
-from mdrs_sde.data.dataset_builder import DatasetBuilder
-from mdrs_sde.models.sde_model import MdrsModeler
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)-8s | %(message)s",
@@ -53,11 +57,7 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--csv", type=str, default=None,
-        help="Path to OHLCV CSV (1-minute bars). Skips data fetch.",
-    )
-    p.add_argument(
-        "--events", type=str, default="data/events_btc_5m.toml",
-        help="Path to events TOML file for STRS-SDE label generation.",
+        help="Path to pre-processed OHLCV CSV (5-min bars).",
     )
     p.add_argument(
         "--start", type=str, default=None,
@@ -66,6 +66,14 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--end", type=str, default=None,
         help="WFA end date override (ISO-8601).",
+    )
+    p.add_argument(
+        "--horizon", type=int, default=None,
+        help="Label horizon override (bars ahead for future return).",
+    )
+    p.add_argument(
+        "--threshold", type=float, default=None,
+        help="Label threshold override (min absolute return for positive label).",
     )
     p.add_argument(
         "--config-dir", type=str, default="configs",
@@ -96,70 +104,79 @@ def _load_config(model: str, config_dir: str) -> dict:
 def main() -> int:
     args = _parse_args()
 
-    # Config
-    with open(_ROOT / "configs" / "backtest_settings.toml", "rb") as fh:
-        bt_cfg = tomllib.load(fh)
-    with open(_ROOT / "configs" / "data_settings.toml", "rb") as fh:
-        ds_cfg = tomllib.load(fh)
-    with open(_ROOT / "src" / "mdrs_sde" / "configs" / "default_config.toml", "rb") as fh:
-        model_cfg = tomllib.load(fh)
+    # ── Config ──
+    cfg = _load_config(args.model, args.config_dir)
 
-    wfa_cfg = bt_cfg["walk_forward_settings"].copy()
+    # WFA date overrides
+    wfa = cfg.setdefault("walk_forward_settings", {})
     if args.start:
-        wfa_cfg["start_date"] = args.start
+        wfa["start_date"] = args.start
     if args.end:
-        wfa_cfg["end_date"] = args.end
-    bt_cfg["walk_forward_settings"] = wfa_cfg
+        wfa["end_date"] = args.end
 
-    dl_cfg = _load_config(args.model, args.config_dir)
+    # Label overrides
+    label_cfg = cfg.setdefault("label", {})
+    if args.horizon is not None:
+        label_cfg["horizon"] = args.horizon
+    if args.threshold is not None:
+        label_cfg["threshold"] = args.threshold
 
-    # Data
+    # ── Data ──
     if args.csv:
-        raw = pd.read_csv(args.csv, index_col=0, parse_dates=True)
+        csv_path = pathlib.Path(args.csv)
     else:
-        csv_path = (
-            _ROOT / "data"
-            / ds_cfg["binance_collection"]["output_filename"]
-        )
-        if not csv_path.exists():
-            log.error("CSV not found: %s", csv_path)
-            return 1
-        raw = pd.read_csv(csv_path, index_col=0, parse_dates=True)
+        csv_path = _ROOT / "data" / "btcusdt_futures_5m.csv"
+
+    if not csv_path.exists():
+        log.error("CSV not found: %s", csv_path)
+        return 1
+
+    log.info("Loading data from %s", csv_path)
+    raw = pd.read_csv(csv_path, index_col=0, parse_dates=True)
 
     if raw.index.tz is not None:
         raw.index = raw.index.tz_convert("UTC").tz_localize(None)
 
-    pre = Preprocessor(settings=ds_cfg["event_detection"])
+    # ── Preprocessing (mdrs-sde feature engineering) ──
+    with open(mdrs_config_path(), "rb") as fh:
+        mdrs_cfg = tomllib.load(fh)
+
+    # Slice to analysis window (avoid processing unnecessary early data)
+    wfa_cfg = cfg.get("walk_forward_settings", {})
+    data_start = wfa_cfg.get("data_start_date")
+    if data_start:
+        raw = raw.loc[data_start:]
+        log.info("Sliced to analysis window from %s: %d rows.", data_start, len(raw))
+
+    pre = Preprocessor(settings=mdrs_cfg["event_detection"])
     full_data = pre.run_full_pipeline(raw)
+    full_data = full_data.dropna(subset=cfg["model"]["input_features"])
+    log.info("Preprocessor applied: %d rows.", len(full_data))
 
-    builder = DatasetBuilder(project_root=_ROOT)
-    events = builder.load_events(pathlib.Path(args.events).name)
-    full_data = builder.apply_event_tagging(full_data, events)
-    train_data = builder.slice_training_data(full_data)
-
-    # STRS-SDE modeler for per-window label generation
-    merged_cfg = {**model_cfg, **bt_cfg}
-    modeler = MdrsModeler(config=merged_cfg)
-
-    # WFA training
+    # ── WFA Training ──
     trainer = WfaTrainer(
         model_name=args.model,
-        config=dl_cfg,
-        bt_config=bt_cfg,
-        mdrs_modeler=modeler,
+        config=cfg,
     )
 
-    log.info("Starting WFA training: model=%s", args.model)
-    all_trades, summaries = trainer.run(full_data, train_data)
+    log.info(
+        "Starting WFA training: model=%s, horizon=%s, threshold=%s",
+        args.model,
+        cfg.get("label", {}).get("horizon", 12),
+        cfg.get("label", {}).get("threshold", 0.003),
+    )
+    predictions, summaries = trainer.run(full_data)
 
-    if all_trades.empty:
-        log.warning("No trades generated.")
+    if predictions.empty:
+        log.warning("No predictions generated.")
         return 1
 
+    # Save predictions for downstream backtesting (quant-research)
     out_dir = _ROOT / "results"
     out_dir.mkdir(exist_ok=True)
-    all_trades.to_csv(out_dir / f"{args.model}_trade_results.csv", index=False)
-    log.info("Trades → results/%s_trade_results.csv", args.model)
+    out_path = out_dir / f"{args.model}_predictions.csv"
+    predictions.to_csv(out_path)
+    log.info("Predictions → %s (%d rows)", out_path, len(predictions))
 
     return 0
 

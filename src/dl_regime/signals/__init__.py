@@ -1,20 +1,19 @@
 """
 dl_regime.signals
 =================
-Signal generation pipeline for DL regime models.
+Label generation for DL regime models.
 
 Exports
 -------
+FutureReturnLabelGenerator
+    Generates binary labels from future price returns for
+    DL supervised training (independent of MDRS-SDE).
 RegimeLabelGenerator
-    Generates binary regime labels from STRS-SDE regime_prob
-    for DL supervised training.
-DlRegimeSignalGenerator
-    Converts DL model output (regime_prob) into signal/confidence
-    columns using the same sticky filter + ADX gate as mdrs-sde.
+    Backward-compatible alias for FutureReturnLabelGenerator.
 """
 from dl_regime.signals.regime_signal import (
-    DlRegimeSignalGenerator,
+    FutureReturnLabelGenerator,
     RegimeLabelGenerator,
 )
 
-__all__ = ["RegimeLabelGenerator", "DlRegimeSignalGenerator"]
+__all__ = ["FutureReturnLabelGenerator", "RegimeLabelGenerator"]

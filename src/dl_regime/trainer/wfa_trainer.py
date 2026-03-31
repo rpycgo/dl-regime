@@ -7,12 +7,14 @@ Expanding-window WFA loop:
 
     for each test window:
         1. Slice expanding train set
-        2. Generate regime labels from STRS-SDE (per-window k, gamma)
+        2. Generate binary labels from future returns (independent of
+           MDRS-SDE — no regime_prob or MCMC estimates involved)
         3. Load checkpoint if exists, else train and save
         4. Predict regime_prob on test set
-        5. Convert to signal via DlRegimeSignalGenerator (fixed params)
-        6. Run backtest via GenericBacktestEngine
-        7. Log metrics to MLflow
+        5. Save predictions and log to MLflow
+
+Signal generation and backtesting are handled downstream by the
+quant-research backtesting module.
 
 All three DL models (LSTM, TCN, Transformer) share this trainer.
 The model architecture is selected via ``model_name`` argument.
@@ -41,10 +43,7 @@ from dl_regime.models import (
     TCNRegimeModel,
     TransformerRegimeModel,
 )
-from dl_regime.signals.regime_signal import (
-    DlRegimeSignalGenerator,
-    RegimeLabelGenerator,
-)
+from dl_regime.signals.regime_signal import FutureReturnLabelGenerator
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +58,6 @@ _MODEL_REGISTRY = {
 class WindowResult:
     """Output container for one WFA window."""
     window_label: str
-    trades: pd.DataFrame
     regime_prob: pd.Series
     checkpoint_path: pathlib.Path
     metrics: dict[str, float] = field(default_factory=dict)
@@ -68,31 +66,28 @@ class WindowResult:
 class WfaTrainer:
     """Expanding-window WFA trainer for DL regime models.
 
+    Labels are generated from **future price returns** so that the DL
+    benchmark is fully independent of MDRS-SDE.  No ``MdrsModeler`` or
+    MCMC estimation is required.
+
+    This trainer is responsible only for **training and prediction**.
+    Signal generation and backtesting are handled by the quant-research
+    backtesting module.
+
     Args:
-        model_name:   One of ``"lstm"``, ``"tcn"``, ``"transformer"``.
-        config:       Merged config dict (``default_config.toml`` +
-                      model-specific yaml).
-        bt_config:    Parsed ``backtest_settings.toml``.
-        mdrs_modeler: Fitted ``MdrsModeler`` instance used to generate
-                      per-window regime labels.  Must expose
-                      ``estimate_parameters()``.
+        model_name: One of ``"lstm"``, ``"tcn"``, ``"transformer"``.
+        config:     Merged config dict (``default_config.toml`` +
+                    model-specific yaml).
 
     Example::
 
-        trainer = WfaTrainer(
-            model_name="lstm",
-            config=config,
-            bt_config=bt_cfg,
-            mdrs_modeler=modeler,
-        )
-        all_trades, summaries = trainer.run(full_data, train_data)
+        trainer = WfaTrainer(model_name="lstm", config=config)
+        predictions, summaries = trainer.run(full_data)
     """
     def __init__(
         self,
         model_name: str,
         config: dict[str, Any],
-        bt_config: dict[str, Any],
-        mdrs_modeler: Any,
         ) -> None:
         if model_name not in _MODEL_REGISTRY:
             raise ValueError(
@@ -101,14 +96,14 @@ class WfaTrainer:
             )
         self._model_name = model_name
         self._cfg = config
-        self._bt_cfg = bt_config
-        self._modeler = mdrs_modeler
 
-        wfa = bt_config["walk_forward_settings"]
+        # WFA window settings
+        wfa = config.get("walk_forward_settings", {})
         self._start = pd.Timestamp(wfa["start_date"])
         self._end = pd.Timestamp(wfa["end_date"])
         self._test_months: int = wfa.get("testing_months", 1)
 
+        # Training hyper-params
         train_cfg = config.get("training", {})
         self._seq_len: int = train_cfg.get("seq_len", 60)
         self._batch_size: int = train_cfg.get("batch_size", 256)
@@ -119,30 +114,30 @@ class WfaTrainer:
         self._seed: int = train_cfg.get("random_seed", 42)
         self._num_workers: int = train_cfg.get("num_workers", 0)
 
+        # Input features
         self._features: list[str] = config.get("model", {}).get(
             "input_features",
             ["hybrid_z_score", "log_return", "direction_indicator",
              "volume_z_score", "absolute_return_z_score"],
         )
 
+        # Checkpoint directory
         ckpt_cfg = config.get("checkpoint", {})
         self._ckpt_dir = pathlib.Path(
             ckpt_cfg.get("dirpath", "checkpoints")
         ) / model_name
 
+        # MLflow
         mlflow_cfg = config.get("mlflow", {})
         mlflow.set_tracking_uri(mlflow_cfg.get("tracking_uri", "mlruns"))
         mlflow.set_experiment(mlflow_cfg.get("experiment_name", "dl-regime-btc"))
 
-        self._label_gen = RegimeLabelGenerator(
-            entry_threshold=bt_config.get("risk_management", {}).get(
-                "entry_probability_threshold", 0.5
-            )
-        )
-        self._signal_gen = DlRegimeSignalGenerator(
-            risk_config=bt_config.get("risk_management", {}),
-            filter_config=bt_config.get("filters", {}),
-            trade_config=bt_config.get("trading_parameters", {}),
+        # Label generator — future-return based (MDRS-SDE independent)
+        label_cfg = config.get("label", {})
+        self._label_gen = FutureReturnLabelGenerator(
+            horizon=label_cfg.get("horizon", 12),
+            threshold=label_cfg.get("threshold", 0.003),
+            col_close=label_cfg.get("col_close", "Close"),
         )
 
     # ------------------------------------------------------------------
@@ -152,26 +147,18 @@ class WfaTrainer:
     def run(
         self,
         full_data: pd.DataFrame,
-        train_data: pd.DataFrame | None = None,
         ) -> tuple[pd.DataFrame, dict[str, dict[str, float]]]:
         """Execute the full expanding-window WFA.
 
         Args:
-            full_data:  Complete preprocessed dataset.
-            train_data: MCMC-eligible subset (in-zone rows) used for
-                        STRS-SDE label generation.  Falls back to
-                        ``full_data`` when ``None``.
+            full_data: Complete preprocessed dataset (must contain
+                       feature columns and ``Close``).
 
         Returns:
-            ``(all_trades, metric_summaries)``
+            ``(predictions_df, metric_summaries)`` where
+            ``predictions_df`` has columns ``[window, regime_prob]``
+            indexed by the original datetime index.
         """
-        from backtesting.engines.engine import GenericBacktestEngine
-        from backtesting.engines.performance import PerformanceAnalyzer
-
-        if train_data is None:
-            train_data = full_data
-
-        engine = GenericBacktestEngine(config=self._bt_cfg)
         test_starts = pd.date_range(
             start=self._start, end=self._end, freq="MS"
         )
@@ -182,7 +169,7 @@ class WfaTrainer:
 
         results: list[WindowResult] = []
         for ts in test_starts:
-            result = self._process_window(ts, train_data, full_data, engine)
+            result = self._process_window(ts, full_data)
             if result is not None:
                 results.append(result)
 
@@ -195,9 +182,7 @@ class WfaTrainer:
     def _process_window(
         self,
         test_start: pd.Timestamp,
-        train_data: pd.DataFrame,
         full_data: pd.DataFrame,
-        engine: Any,
         ) -> WindowResult | None:
         label = test_start.strftime("%Y-%m-%d")
         test_end = min(
@@ -215,34 +200,13 @@ class WfaTrainer:
             logger.warning("Window %s skipped — insufficient rows.", label)
             return None
 
-        # Generate per-window labels from STRS-SDE
-        in_zone_slice = train_data.loc[:train_end].copy()
-        if len(in_zone_slice) < 100:
-            logger.warning(
-                "Window %s: insufficient in-zone rows for STRS-SDE label.",
-                label,
-            )
-            return None
+        # ── Label generation (future-return based, MDRS-SDE independent) ──
+        train_slice = self._label_gen.generate(train_slice)
 
-        _trace, _summary, estimates = self._modeler.estimate_parameters(
-            z_values=in_zone_slice["hybrid_z_score"].values,
-            returns_scaled=in_zone_slice["log_return"].values * 100,
-            direction=in_zone_slice["direction_indicator"].values,
-        )
-        if estimates is None:
-            logger.warning("Window %s: STRS-SDE estimation failed.", label)
-            return None
-
-        k = float(estimates["k"])
-        gamma = float(estimates["gamma"])
-        entry_thr = self._bt_cfg.get("risk_management", {}).get(
-            "entry_probability_threshold", 0.5
-        )
-        train_slice["regime_prob_sde"] = 1.0 / (
-            1.0 + np.exp(-k * (train_slice["hybrid_z_score"] - gamma))
-        )
-        train_slice = self._label_gen.generate(
-            train_slice, train_slice["regime_prob_sde"]
+        pos_rate = train_slice["regime_label"].mean()
+        logger.info(
+            "Window %s: %d train rows, positive label rate %.1f%%",
+            label, len(train_slice), pos_rate * 100,
         )
 
         # Load or train model
@@ -251,26 +215,8 @@ class WfaTrainer:
         if model is None:
             return None
 
-        # Predict
+        # Predict on test set
         regime_prob = self._predict(model, test_slice)
-
-        # Signal + backtest
-        signal_df = self._signal_gen.generate(test_slice, regime_prob)
-        fixed_params = self._signal_gen.get_fixed_params()
-        trades = engine.run_backtest(signal_df, fixed_params)
-
-        # Metrics
-        metrics: dict[str, float] = {}
-        if not trades.empty:
-            from backtesting.engines.performance import PerformanceAnalyzer
-            m, _eq, _dd = PerformanceAnalyzer.calculate_metrics(trades)
-            if m:
-                metrics = {
-                    "sharpe": m["sharpe_ratio"],
-                    "mdd": m["max_drawdown_pct"],
-                    "return": m["total_return_pct"],
-                    "win_rate": m["win_rate_pct"],
-                }
 
         # MLflow logging
         with mlflow.start_run(
@@ -279,20 +225,20 @@ class WfaTrainer:
             mlflow.log_params({
                 "model": self._model_name,
                 "window": label,
-                "k": k,
-                "gamma": gamma,
+                "label_horizon": self._label_gen.horizon,
+                "label_threshold": self._label_gen.threshold,
+                "train_rows": len(train_slice),
+                "test_rows": len(test_slice),
+                "positive_label_rate": round(pos_rate, 4),
             })
-            mlflow.log_metrics(metrics)
             mlflow.pytorch.log_model(model, "model")
 
         return WindowResult(
             window_label=label,
-            trades=trades,
             regime_prob=pd.Series(
                 regime_prob, index=test_slice.index, name="regime_prob"
             ),
             checkpoint_path=ckpt_path,
-            metrics=metrics,
         )
 
     def _load_or_train(
@@ -315,7 +261,7 @@ class WfaTrainer:
         window_label: str,
         ckpt_path: pathlib.Path,
         ) -> Any | None:
-        # Train / val split
+        # Train / val split (temporal — no shuffling of split boundary)
         n = len(train_df)
         val_n = max(1, int(n * self._val_split))
         train_part = train_df.iloc[:-val_n]
@@ -362,16 +308,21 @@ class WfaTrainer:
         trainer = Trainer(
             max_epochs=self._max_epochs,
             callbacks=callbacks,
-            enable_progress_bar=False,
-            enable_model_summary=False,
-            logger=False,
+            enable_progress_bar=True,
+            enable_model_summary=True,
+            logger=True,
         )
         trainer.fit(model, train_loader, val_loader)
 
         # Save metadata
         meta_path = ckpt_path.parent / "metadata.json"
         with open(meta_path, "w") as fh:
-            json.dump({"window": window_label, "model": self._model_name}, fh)
+            json.dump({
+                "window": window_label,
+                "model": self._model_name,
+                "label_horizon": self._label_gen.horizon,
+                "label_threshold": self._label_gen.threshold,
+            }, fh)
 
         return model
 
@@ -396,13 +347,18 @@ class WfaTrainer:
         model: Any,
         test_df: pd.DataFrame,
         ) -> np.ndarray:
-        """Run inference and return regime_prob array."""
-        # Build dataset with training scaler — use dummy labels
+        """Run inference and return regime_prob array aligned to test_df.
+
+        Handles NaN rows (dropped by RegimeDataset) and seq_len padding
+        so the output length always matches ``len(test_df)``.
+        """
         test_df = test_df.copy()
         test_df["regime_label"] = 0
 
-        # Reuse scaler stored in model hparams is not straightforward;
-        # fit a new scaler on test features (acceptable for inference)
+        # Identify valid (non-NaN) rows before dataset drops them
+        valid_mask = test_df[self._features + ["regime_label"]].notna().all(axis=1)
+        n_valid = valid_mask.sum()
+
         ds = RegimeDataset(test_df, self._features, self._seq_len)
         loader = DataLoader(
             ds, batch_size=self._batch_size,
@@ -416,24 +372,42 @@ class WfaTrainer:
         preds = trainer.predict(model, loader)
         prob = torch.cat(preds).numpy()
 
-        # Pad the first seq_len - 1 rows with 0.5 (no signal)
-        pad = np.full(self._seq_len - 1, 0.5, dtype=np.float32)
+        # len(ds) = n_valid - seq_len → prob covers indices [seq_len-1 .. n_valid-1]
+        # Fill full-length array: 0.5 for non-predictable positions
+        full_prob = np.full(len(test_df), 0.5, dtype=np.float32)
+        valid_indices = np.where(valid_mask.values)[0]
 
-        return np.concatenate([pad, prob])
+        # Map model outputs to their original positions
+        for i, p in enumerate(prob):
+            original_idx = valid_indices[i + self._seq_len]
+            full_prob[original_idx] = p
+
+        return full_prob
 
     @staticmethod
     def _aggregate(
         results: list[WindowResult],
         ) -> tuple[pd.DataFrame, dict[str, dict[str, float]]]:
-        trade_frames = [r.trades for r in results if not r.trades.empty]
-        summaries = {r.window_label: r.metrics for r in results}
+        """Combine per-window predictions into a single DataFrame.
 
-        all_trades = (
-            pd.concat(trade_frames)
-            .sort_values("entry_time")
-            .reset_index(drop=True)
-            if trade_frames
-            else pd.DataFrame()
+        Returns:
+            ``(predictions_df, summaries)`` where ``predictions_df``
+            concatenates all window regime_prob Series with a
+            ``window`` column, and ``summaries`` maps window labels
+            to metric dicts.
+        """
+        pred_frames = []
+        summaries = {}
+        for r in results:
+            pdf = r.regime_prob.to_frame()
+            pdf["window"] = r.window_label
+            pred_frames.append(pdf)
+            summaries[r.window_label] = r.metrics
+
+        predictions = (
+            pd.concat(pred_frames).sort_index()
+            if pred_frames
+            else pd.DataFrame(columns=["regime_prob", "window"])
         )
 
-        return all_trades, summaries
+        return predictions, summaries
