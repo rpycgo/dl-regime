@@ -1,0 +1,81 @@
+# dl_regime/configs/default_config.toml
+#
+# Package-bundled default configuration for DL regime detection models.
+# Asset-specific or experiment-specific overrides go in configs/<model>.yaml.
+
+# ---------------------------------------------------------------------------
+# Shared training settings
+# ---------------------------------------------------------------------------
+[training]
+seq_len        = 60        # input sequence length (bars) — 5h at 5m
+batch_size     = 256
+max_epochs     = 100
+learning_rate  = 1e-3
+early_stopping_patience = 10
+val_split      = 0.2       # fraction of train data for validation
+random_seed    = 42
+num_workers    = 0         # DataLoader workers (0 = main process)
+
+# ---------------------------------------------------------------------------
+# Walk forward settings
+# ---------------------------------------------------------------------------
+
+[walk_forward_settings]
+start_date      = "2024-01-01"
+end_date        = "2026-01-31"
+testing_months  = 1
+
+# ---------------------------------------------------------------------------
+# Shared model settings
+# ---------------------------------------------------------------------------
+[model]
+input_features = [
+    "hybrid_z_score",
+    "log_return",
+    "direction_indicator",
+    "volume_z_score",
+    "absolute_return_z_score",
+]
+dropout = 0.2
+
+# ---------------------------------------------------------------------------
+# LSTM
+# ---------------------------------------------------------------------------
+[lstm]
+hidden_size  = 128
+num_layers   = 2
+bidirectional = false
+
+# ---------------------------------------------------------------------------
+# TCN
+# ---------------------------------------------------------------------------
+[tcn]
+num_channels  = [64, 64, 128, 128]   # channel sizes per residual block
+kernel_size   = 3
+dilation_base = 2
+
+# ---------------------------------------------------------------------------
+# Transformer
+# ---------------------------------------------------------------------------
+[transformer]
+d_model     = 64
+nhead       = 4
+num_layers  = 3
+dim_feedforward = 256
+
+# ---------------------------------------------------------------------------
+# Checkpoint management
+# ---------------------------------------------------------------------------
+[checkpoint]
+dirpath      = "checkpoints"
+filename     = "{model}-{window}-{epoch:02d}"
+save_top_k   = 1
+monitor      = "val_loss"
+mode         = "min"
+
+# ---------------------------------------------------------------------------
+# MLflow
+# ---------------------------------------------------------------------------
+[mlflow]
+experiment_name = "dl-regime-btc"
+tracking_uri    = "mlruns"
