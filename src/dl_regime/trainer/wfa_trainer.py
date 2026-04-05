@@ -3,10 +3,10 @@ dl_regime.trainer.wfa_trainer
 ==============================
 Walk-forward analysis trainer for DL regime models.
 
-Expanding-window WFA loop:
+Rolling-window WFA loop:
 
     for each test window:
-        1. Slice expanding train set
+        1. Slice rolling 3-month train set
         2. Generate binary labels from future returns (independent of
            MDRS-SDE — no regime_prob or MCMC estimates involved)
         3. Load checkpoint if exists, else train and save
@@ -64,7 +64,7 @@ class WindowResult:
 
 
 class WfaTrainer:
-    """Expanding-window WFA trainer for DL regime models.
+    """Rolling-window WFA trainer for DL regime models.
 
     Labels are generated from **future price returns** so that the DL
     benchmark is fully independent of MDRS-SDE.  No ``MdrsModeler`` or
@@ -101,7 +101,8 @@ class WfaTrainer:
         wfa = config.get("walk_forward_settings", {})
         self._start = pd.Timestamp(wfa["start_date"])
         self._end = pd.Timestamp(wfa["end_date"])
-        self._test_months: int = wfa.get("testing_months", 1)
+        self._test_months = wfa.get("testing_months", 1)
+        self._train_months = wfa.get("training_months", 3)
 
         # Training hyper-params
         train_cfg = config.get("training", {})
@@ -148,7 +149,7 @@ class WfaTrainer:
         self,
         full_data: pd.DataFrame,
         ) -> tuple[pd.DataFrame, dict[str, dict[str, float]]]:
-        """Execute the full expanding-window WFA.
+        """Execute the full rolling-window WFA.
 
         Args:
             full_data: Complete preprocessed dataset (must contain
@@ -191,9 +192,10 @@ class WfaTrainer:
             self._end,
         )
 
-        # Expanding window — all data before test_start
-        train_end = test_start - pd.Timedelta(seconds=1)
-        train_slice = full_data.loc[:train_end].copy()
+        # Rolling window — 3 months before test_start (mirrors quant-research WalkForwardRunner)
+        train_end   = test_start - pd.Timedelta(seconds=1)
+        train_start = train_end - relativedelta(months=self._train_months)
+        train_slice = full_data.loc[train_start:train_end].copy()
         test_slice = full_data.loc[test_start:test_end].copy()
 
         if len(train_slice) < 1000:
