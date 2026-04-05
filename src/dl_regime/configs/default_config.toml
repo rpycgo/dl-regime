@@ -7,7 +7,7 @@
 # Shared training settings
 # ---------------------------------------------------------------------------
 [training]
-seq_len        = 60        # input sequence length (bars) — 5h at 5m
+seq_len        = 288        # input sequence length (bars) — 5h at 5m
 batch_size     = 256
 max_epochs     = 100
 learning_rate  = 1e-3
