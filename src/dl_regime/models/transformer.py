@@ -22,7 +22,7 @@ class _PositionalEncoding(nn.Module):
     """Sinusoidal positional encoding (non-learnable)."""
     def __init__(self, d_model: int, max_len: int = 512) -> None:
         super().__init__()
-        pe = torch.zeros(max_len, d_model)
+        pe  = torch.zeros(max_len, d_model)
         pos = torch.arange(max_len).unsqueeze(1).float()
         div = torch.exp(
             torch.arange(0, d_model, 2).float()
@@ -30,14 +30,14 @@ class _PositionalEncoding(nn.Module):
         )
         pe[:, 0::2] = torch.sin(pos * div)
         pe[:, 1::2] = torch.cos(pos * div)
-        self.register_buffer("pe", pe.unsqueeze(0))   # (1, max_len, d_model)
+        self.register_buffer("pe", pe.unsqueeze(0))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x + self.pe[:, : x.size(1)]
 
 
 class TransformerRegimeModel(BaseRegimeModule):
-    """Encoder-only Transformer for binary regime classification.
+    """Encoder-only Transformer for 3-class directional regime classification.
 
     Args:
         input_size:      Number of input features.
@@ -66,7 +66,7 @@ class TransformerRegimeModel(BaseRegimeModule):
         dim_feedforward: int = 256,
         dropout: float = 0.2,
         learning_rate: float = 1e-3,
-    ) -> None:
+        ) -> None:
         super().__init__(learning_rate=learning_rate)
         self.save_hyperparameters()
 
@@ -80,11 +80,11 @@ class TransformerRegimeModel(BaseRegimeModule):
             dropout=dropout,
             batch_first=True,
         )
-        self._encoder = nn.TransformerEncoder(
-            encoder_layer, num_layers=num_layers
+        self._encoder  = nn.TransformerEncoder(
+            encoder_layer, num_layers=num_layers,
         )
-        self._dropout = nn.Dropout(dropout)
-        self._fc = nn.Linear(d_model, 1)
+        self._dropout  = nn.Dropout(dropout)
+        self._fc       = nn.Linear(d_model, self.NUM_CLASSES)
 
     def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
         """Forward pass.
@@ -93,14 +93,15 @@ class TransformerRegimeModel(BaseRegimeModule):
             x: Float32 tensor ``(batch, seq_len, input_size)``.
 
         Returns:
-            Dict with ``logit`` and ``regime_prob`` tensors of shape ``(batch,)``.
+            Dict with ``logits`` (batch, 3) and ``regime_prob`` (batch,).
         """
-        out = self._pos_enc(self._input_proj(x))
-        out = self._encoder(out)
-        last = self._dropout(out[:, -1, :])
-        logit = self._fc(last).squeeze(-1)
+        out    = self._pos_enc(self._input_proj(x))
+        out    = self._encoder(out)
+        last   = self._dropout(out[:, -1, :])
+        logits = self._fc(last)
+        probs  = torch.softmax(logits, dim=-1)
 
         return {
-            "logit": logit,
-            "regime_prob": torch.sigmoid(logit),
+            "logits"     : logits,
+            "regime_prob": probs[:, 1],   # P(Long)
         }
