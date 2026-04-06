@@ -1,7 +1,7 @@
 """
 dl_regime.models.tcn
 ====================
-Temporal Convolutional Network (TCN) for regime detection.
+Temporal Convolutional Network (TCN) for directional regime detection.
 
 Implements dilated causal convolutions with residual connections.
 The receptive field grows exponentially with depth, allowing the model
@@ -38,9 +38,9 @@ class _CausalConv1d(nn.Module):
                 padding=padding, dilation=dilation,
             )
         )
-        self._chomp = padding          # remove future padding
-        self._relu = nn.ReLU()
-        self._drop = nn.Dropout(dropout)
+        self._chomp = padding
+        self._relu  = nn.ReLU()
+        self._drop  = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = self._conv(x)
@@ -60,12 +60,12 @@ class _ResidualBlock(nn.Module):
     ) -> None:
         super().__init__()
         self._conv1 = _CausalConv1d(
-            in_channels, out_channels, kernel_size, dilation, dropout
+            in_channels, out_channels, kernel_size, dilation, dropout,
         )
         self._conv2 = _CausalConv1d(
-            out_channels, out_channels, kernel_size, dilation, dropout
+            out_channels, out_channels, kernel_size, dilation, dropout,
         )
-        self._skip = (
+        self._skip  = (
             nn.Conv1d(in_channels, out_channels, 1)
             if in_channels != out_channels
             else nn.Identity()
@@ -77,7 +77,7 @@ class _ResidualBlock(nn.Module):
 
 
 class TCNRegimeModel(BaseRegimeModule):
-    """Temporal Convolutional Network for binary regime classification.
+    """Temporal Convolutional Network for 3-class directional regime classification.
 
     Args:
         input_size:    Number of input features.
@@ -114,12 +114,12 @@ class TCNRegimeModel(BaseRegimeModule):
         for i, out_ch in enumerate(num_channels):
             dilation = dilation_base ** i
             layers.append(
-                _ResidualBlock(in_ch, out_ch, kernel_size, dilation, dropout)
+                _ResidualBlock(in_ch, out_ch, kernel_size, dilation, dropout),
             )
             in_ch = out_ch
 
         self._network = nn.Sequential(*layers)
-        self._fc = nn.Linear(in_ch, 1)
+        self._fc      = nn.Linear(in_ch, self.NUM_CLASSES)
 
     def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
         """Forward pass.
@@ -128,12 +128,13 @@ class TCNRegimeModel(BaseRegimeModule):
             x: Float32 tensor ``(batch, seq_len, input_size)``.
 
         Returns:
-            Dict with ``logit`` and ``regime_prob`` tensors of shape ``(batch,)``.
+            Dict with ``logits`` (batch, 3) and ``regime_prob`` (batch,).
         """
-        out = self._network(x.permute(0, 2, 1))
-        logit = self._fc(out[:, :, -1]).squeeze(-1)
+        out    = self._network(x.permute(0, 2, 1))
+        logits = self._fc(out[:, :, -1])
+        probs  = torch.softmax(logits, dim=-1)
 
         return {
-            "logit": logit,
-            "regime_prob": torch.sigmoid(logit),
+            "logits"     : logits,
+            "regime_prob": probs[:, 1],   # P(Long)
         }
