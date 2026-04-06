@@ -7,8 +7,8 @@ Rolling-window WFA loop:
 
     for each test window:
         1. Slice rolling 3-month train set
-        2. Generate binary labels from future returns (independent of
-           MDRS-SDE — no regime_prob or MCMC estimates involved)
+        2. Generate directional 3-class labels from future returns
+           (independent of MDRS-SDE — no regime_prob or MCMC estimates)
         3. Load checkpoint if exists, else train and save
         4. Predict regime_prob on test set
         5. Save predictions and log to MLflow
@@ -99,21 +99,21 @@ class WfaTrainer:
 
         # WFA window settings
         wfa = config.get("walk_forward_settings", {})
-        self._start = pd.Timestamp(wfa["start_date"])
-        self._end = pd.Timestamp(wfa["end_date"])
-        self._test_months = wfa.get("testing_months", 1)
+        self._start        = pd.Timestamp(wfa["start_date"])
+        self._end          = pd.Timestamp(wfa["end_date"])
+        self._test_months  = wfa.get("testing_months", 1)
         self._train_months = wfa.get("training_months", 3)
 
         # Training hyper-params
         train_cfg = config.get("training", {})
-        self._seq_len: int = train_cfg.get("seq_len", 60)
-        self._batch_size: int = train_cfg.get("batch_size", 256)
-        self._max_epochs: int = train_cfg.get("max_epochs", 100)
-        self._lr: float = train_cfg.get("learning_rate", 1e-3)
-        self._patience: int = train_cfg.get("early_stopping_patience", 10)
-        self._val_split: float = train_cfg.get("val_split", 0.2)
-        self._seed: int = train_cfg.get("random_seed", 42)
-        self._num_workers: int = train_cfg.get("num_workers", 0)
+        self._seq_len     = train_cfg.get("seq_len", 288)
+        self._batch_size  = train_cfg.get("batch_size", 256)
+        self._max_epochs  = train_cfg.get("max_epochs", 100)
+        self._lr          = train_cfg.get("learning_rate", 1e-3)
+        self._patience    = train_cfg.get("early_stopping_patience", 10)
+        self._val_split   = train_cfg.get("val_split", 0.2)
+        self._seed        = train_cfg.get("random_seed", 42)
+        self._num_workers = train_cfg.get("num_workers", 0)
 
         # Input features
         self._features: list[str] = config.get("model", {}).get(
@@ -192,23 +192,26 @@ class WfaTrainer:
             self._end,
         )
 
-        # Rolling window — 3 months before test_start (mirrors quant-research WalkForwardRunner)
+        # Rolling window — 3 months before test_start
         train_end   = test_start - pd.Timedelta(seconds=1)
         train_start = train_end - relativedelta(months=self._train_months)
         train_slice = full_data.loc[train_start:train_end].copy()
-        test_slice = full_data.loc[test_start:test_end].copy()
+        test_slice  = full_data.loc[test_start:test_end].copy()
 
         if len(train_slice) < 1000:
             logger.warning("Window %s skipped — insufficient rows.", label)
             return None
 
-        # ── Label generation (future-return based, MDRS-SDE independent) ──
+        # Label generation (directional 3-class, MDRS-SDE independent)
         train_slice = self._label_gen.generate(train_slice)
 
-        pos_rate = train_slice["regime_label"].mean()
+        long_rate  = (train_slice["regime_label"] == 1).mean()
+        short_rate = (train_slice["regime_label"] == 2).mean()
         logger.info(
-            "Window %s: %d train rows, positive label rate %.1f%%",
-            label, len(train_slice), pos_rate * 100,
+            "Window %s: %d train rows | long %.1f%% | short %.1f%% | flat %.1f%%",
+            label, len(train_slice),
+            long_rate * 100, short_rate * 100,
+            (1 - long_rate - short_rate) * 100,
         )
 
         # Load or train model
@@ -217,21 +220,22 @@ class WfaTrainer:
         if model is None:
             return None
 
-        # Predict on test set
+        # Predict on test set — returns P(Long) array
         regime_prob = self._predict(model, test_slice)
 
         # MLflow logging
         with mlflow.start_run(
             run_name=f"{self._model_name}_{label}", nested=True
-        ):
+            ):
             mlflow.log_params({
-                "model": self._model_name,
-                "window": label,
-                "label_horizon": self._label_gen.horizon,
-                "label_threshold": self._label_gen.threshold,
-                "train_rows": len(train_slice),
-                "test_rows": len(test_slice),
-                "positive_label_rate": round(pos_rate, 4),
+                "model":               self._model_name,
+                "window":              label,
+                "label_horizon":       self._label_gen.horizon,
+                "label_threshold":     self._label_gen.threshold,
+                "train_rows":          len(train_slice),
+                "test_rows":           len(test_slice),
+                "long_label_rate":     round(long_rate, 4),
+                "short_label_rate":    round(short_rate, 4),
             })
             mlflow.pytorch.log_model(model, "model")
 
@@ -267,10 +271,10 @@ class WfaTrainer:
         n = len(train_df)
         val_n = max(1, int(n * self._val_split))
         train_part = train_df.iloc[:-val_n]
-        val_part = train_df.iloc[-val_n:]
+        val_part   = train_df.iloc[-val_n:]
 
         train_ds = RegimeDataset(train_part, self._features, self._seq_len)
-        val_ds = RegimeDataset(
+        val_ds   = RegimeDataset(
             val_part, self._features, self._seq_len,
             scaler=train_ds.scaler,
         )
@@ -316,13 +320,12 @@ class WfaTrainer:
         )
         trainer.fit(model, train_loader, val_loader)
 
-        # Save metadata
         meta_path = ckpt_path.parent / "metadata.json"
         with open(meta_path, "w") as fh:
             json.dump({
-                "window": window_label,
-                "model": self._model_name,
-                "label_horizon": self._label_gen.horizon,
+                "window":          window_label,
+                "model":           self._model_name,
+                "label_horizon":   self._label_gen.horizon,
                 "label_threshold": self._label_gen.threshold,
             }, fh)
 
@@ -349,17 +352,16 @@ class WfaTrainer:
         model: Any,
         test_df: pd.DataFrame,
         ) -> np.ndarray:
-        """Run inference and return regime_prob array aligned to test_df.
+        """Run inference and return P(Long) array aligned to test_df.
 
-        Handles NaN rows (dropped by RegimeDataset) and seq_len padding
-        so the output length always matches ``len(test_df)``.
+        predict_step returns (batch, 3) softmax probabilities for
+        [flat, long, short]. This method extracts P(Long) = probs[:, 1]
+        and maps back to the original test_df index.
         """
         test_df = test_df.copy()
         test_df["regime_label"] = 0
 
-        # Identify valid (non-NaN) rows before dataset drops them
         valid_mask = test_df[self._features + ["regime_label"]].notna().all(axis=1)
-        n_valid = valid_mask.sum()
 
         ds = RegimeDataset(test_df, self._features, self._seq_len)
         loader = DataLoader(
@@ -372,15 +374,16 @@ class WfaTrainer:
             logger=False,
         )
         preds = trainer.predict(model, loader)
-        prob = torch.cat(preds).numpy()
 
-        # len(ds) = n_valid - seq_len → prob covers indices [seq_len-1 .. n_valid-1]
+        # preds: list of (batch, 3) tensors → (n_windows, 3)
+        prob_matrix = torch.cat(preds).numpy()
+        long_probs  = prob_matrix[:, 1]   # P(Long)
+
         # Fill full-length array: 0.5 for non-predictable positions
-        full_prob = np.full(len(test_df), 0.5, dtype=np.float32)
+        full_prob     = np.full(len(test_df), 0.5, dtype=np.float32)
         valid_indices = np.where(valid_mask.values)[0]
 
-        # Map model outputs to their original positions
-        for i, p in enumerate(prob):
+        for i, p in enumerate(long_probs):
             original_idx = valid_indices[i + self._seq_len]
             full_prob[original_idx] = p
 
@@ -399,7 +402,7 @@ class WfaTrainer:
             to metric dicts.
         """
         pred_frames = []
-        summaries = {}
+        summaries   = {}
         for r in results:
             pdf = r.regime_prob.to_frame()
             pdf["window"] = r.window_label

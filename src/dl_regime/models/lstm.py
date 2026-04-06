@@ -1,10 +1,10 @@
 """
 dl_regime.models.lstm
 =====================
-LSTM-based regime detection model.
+LSTM-based directional regime detection model.
 
-Uses a stacked LSTM followed by a linear projection to produce a
-regime logit.  Supports optional bidirectional mode.
+Uses a stacked LSTM followed by a linear projection to produce
+3-class directional regime logits (flat / long / short).
 """
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from dl_regime.models.base import BaseRegimeModule
 
 
 class LSTMRegimeModel(BaseRegimeModule):
-    """Stacked LSTM for binary regime classification.
+    """Stacked LSTM for 3-class directional regime classification.
 
     Args:
         input_size:    Number of input features.
@@ -50,7 +50,7 @@ class LSTMRegimeModel(BaseRegimeModule):
             bidirectional=bidirectional,
         )
         fc_input = hidden_size * (2 if bidirectional else 1)
-        self._fc = nn.Linear(fc_input, 1)
+        self._fc = nn.Linear(fc_input, self.NUM_CLASSES)
         self._dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
@@ -60,13 +60,14 @@ class LSTMRegimeModel(BaseRegimeModule):
             x: Float32 tensor ``(batch, seq_len, input_size)``.
 
         Returns:
-            Dict with ``logit`` and ``regime_prob`` tensors of shape ``(batch,)``.
+            Dict with ``logits`` (batch, 3) and ``regime_prob`` (batch,).
         """
         out, _ = self._lstm(x)
-        last = self._dropout(out[:, -1, :])
-        logit = self._fc(last).squeeze(-1)
+        last   = self._dropout(out[:, -1, :])
+        logits = self._fc(last)
+        probs  = torch.softmax(logits, dim=-1)
 
         return {
-            "logit": logit,
-            "regime_prob": torch.sigmoid(logit),
+            "logits"     : logits,
+            "regime_prob": probs[:, 1],   # P(Long)
         }
