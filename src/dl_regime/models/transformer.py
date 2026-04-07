@@ -37,7 +37,7 @@ class _PositionalEncoding(nn.Module):
 
 
 class TransformerRegimeModel(BaseRegimeModule):
-    """Encoder-only Transformer for 3-class directional regime classification.
+    """Encoder-only Transformer for binary regime classification.
 
     Args:
         input_size:      Number of input features.
@@ -84,7 +84,7 @@ class TransformerRegimeModel(BaseRegimeModule):
             encoder_layer, num_layers=num_layers,
         )
         self._dropout  = nn.Dropout(dropout)
-        self._fc       = nn.Linear(d_model, self.NUM_CLASSES)
+        self._fc       = nn.Linear(d_model, 1)
 
     def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
         """Forward pass.
@@ -93,15 +93,14 @@ class TransformerRegimeModel(BaseRegimeModule):
             x: Float32 tensor ``(batch, seq_len, input_size)``.
 
         Returns:
-            Dict with ``logits`` (batch, 3) and ``regime_prob`` (batch,).
+            Dict with ``logit`` (batch,) and ``regime_prob`` (batch,).
         """
-        out    = self._pos_enc(self._input_proj(x))
-        out    = self._encoder(out)
-        last   = self._dropout(out[:, -1, :])
-        logits = self._fc(last)
-        probs  = torch.softmax(logits, dim=-1)
+        out   = self._pos_enc(self._input_proj(x))
+        out   = self._encoder(out)
+        last  = self._dropout(out[:, -1, :])
+        logit = self._fc(last).squeeze(-1)
 
         return {
-            "logits"     : logits,
-            "regime_prob": probs[:, 1],   # P(Long)
+            "logit"      : logit,
+            "regime_prob": torch.sigmoid(logit),
         }

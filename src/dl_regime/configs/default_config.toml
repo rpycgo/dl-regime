@@ -7,7 +7,7 @@
 # Shared training settings
 # ---------------------------------------------------------------------------
 [training]
-seq_len        = 288        # input sequence length (bars) — 5h at 5m
+seq_len        = 288       # 24h look-back at 5m interval
 batch_size     = 256
 max_epochs     = 100
 learning_rate  = 1e-3
@@ -25,6 +25,15 @@ start_date      = "2020-01-01"
 end_date        = "2026-01-31"
 training_months = 3
 testing_months  = 1
+
+
+# ---------------------------------------------------------------------------
+# Label generation
+# ---------------------------------------------------------------------------
+[label]
+horizon   = 12     # bars ahead for future return (12 x 5m = 1 hour)
+threshold = 0.005  # min absolute return for breakout label (0.5%)
+col_close = "Close"
 
 # ---------------------------------------------------------------------------
 # Shared model settings

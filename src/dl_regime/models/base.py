@@ -4,18 +4,12 @@ dl_regime.models.base
 Abstract PyTorch Lightning base module for all regime detection models.
 
 Standardises:
-- 3-class CrossEntropy training and validation steps
-- Softmax output → class probabilities in [0, 1]
+- Binary cross-entropy training and validation steps
+- Sigmoid output → regime_prob in [0, 1]
 - predict_step for inference (no gradient)
 - Shared optimizer (Adam with configurable lr)
 
-Label convention:
-    0 = flat
-    1 = long
-    2 = short
-
-All concrete models inherit this and only implement ``forward()``
-which must return logits of shape (batch, 3).
+All concrete models inherit this and only implement ``forward()``.
 """
 from __future__ import annotations
 
@@ -28,14 +22,14 @@ from torch.optim import Adam
 
 
 class BaseRegimeModule(L.LightningModule):
-    """Abstract base for directional regime classification models.
+    """Abstract base for binary regime classification models.
 
     Subclasses must implement :meth:`forward` which takes a float32
     tensor of shape ``(batch, seq_len, n_features)`` and returns a
     dict with:
 
-    * ``logits``      — raw logit tensor ``(batch, 3)``
-    * ``regime_prob`` — softmax probability for Long class ``(batch,)``
+    * ``logit``       — raw logit tensor ``(batch,)``
+    * ``regime_prob`` — sigmoid probability tensor ``(batch,)``
 
     Args:
         learning_rate: Adam learning rate.
@@ -45,14 +39,12 @@ class BaseRegimeModule(L.LightningModule):
         class MyModel(BaseRegimeModule):
             def forward(self, x):
                 ...
-                return {"logits": logits, "regime_prob": probs[:, 1]}
+                return {"logit": logit, "regime_prob": torch.sigmoid(logit)}
     """
-    NUM_CLASSES = 3  # 0=flat, 1=long, 2=short
-
     def __init__(self, learning_rate: float = 1e-3) -> None:
         super().__init__()
         self.learning_rate = learning_rate
-        self._criterion = nn.CrossEntropyLoss()
+        self._criterion = nn.BCEWithLogitsLoss()
 
     # ------------------------------------------------------------------
     # Abstract interface
@@ -68,8 +60,8 @@ class BaseRegimeModule(L.LightningModule):
         Returns:
             Dict with keys:
 
-            * ``logits``      — raw logit tensor ``(batch, 3)``
-            * ``regime_prob`` — P(Long) = softmax(logits)[:, 1] ``(batch,)``
+            * ``logit``       — raw logit tensor ``(batch,)``
+            * ``regime_prob`` — sigmoid probability tensor ``(batch,)``
         """
         pass
 
@@ -82,10 +74,9 @@ class BaseRegimeModule(L.LightningModule):
         batch: dict[str, torch.Tensor],
         batch_idx: int,
         ) -> torch.Tensor:
-        out = self(batch["x"])
-        loss = self._criterion(out["logits"], batch["y"])
+        out  = self(batch["x"])
+        loss = self._criterion(out["logit"], batch["y"])
         self.log("train_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
-
         return loss
 
     def validation_step(
@@ -93,8 +84,8 @@ class BaseRegimeModule(L.LightningModule):
         batch: dict[str, torch.Tensor],
         batch_idx: int,
         ) -> None:
-        out = self(batch["x"])
-        loss = self._criterion(out["logits"], batch["y"])
+        out  = self(batch["x"])
+        loss = self._criterion(out["logit"], batch["y"])
         self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
 
     def predict_step(
@@ -102,14 +93,13 @@ class BaseRegimeModule(L.LightningModule):
         batch: dict[str, torch.Tensor],
         batch_idx: int,
         ) -> torch.Tensor:
-        """Return class probabilities for inference.
+        """Return sigmoid regime probability for inference.
 
         Returns:
-            Float32 tensor of shape ``(batch, 3)`` — softmax probabilities
-            for [flat, long, short].
+            Float32 tensor of shape ``(batch,)`` with values in [0, 1].
         """
         with torch.no_grad():
-            return torch.softmax(self(batch["x"])["logits"], dim=-1)
+            return self(batch["x"])["regime_prob"]
 
     # ------------------------------------------------------------------
     # Optimizer
