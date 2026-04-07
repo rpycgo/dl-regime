@@ -35,6 +35,7 @@ import torch
 from dateutil.relativedelta import relativedelta
 from lightning import Trainer
 from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
+from lightning.pytorch.loggers import CSVLogger
 from torch.utils.data import DataLoader
 
 from dl_regime.data.dataset import RegimeDataset
@@ -113,7 +114,7 @@ class WfaTrainer:
         self._patience    = train_cfg.get("early_stopping_patience", 10)
         self._val_split   = train_cfg.get("val_split", 0.2)
         self._seed        = train_cfg.get("random_seed", 42)
-        self._num_workers = train_cfg.get("num_workers", 0)
+        self._num_workers = train_cfg.get("num_workers", 4)
 
         # Input features
         self._features: list[str] = config.get("model", {}).get(
@@ -128,6 +129,10 @@ class WfaTrainer:
             ckpt_cfg.get("dirpath", "checkpoints")
         ) / model_name
 
+        # Trainer settings
+        trainer_cfg            = config.get("trainer", {})
+        self._default_root_dir = trainer_cfg.get("default_root_dir", f"lightning_logs/{model_name}")
+
         # MLflow
         mlflow_cfg = config.get("mlflow", {})
         mlflow.set_tracking_uri(mlflow_cfg.get("tracking_uri", "mlruns"))
@@ -137,7 +142,7 @@ class WfaTrainer:
         label_cfg = config.get("label", {})
         self._label_gen = FutureReturnLabelGenerator(
             horizon=label_cfg.get("horizon", 12),
-            threshold=label_cfg.get("threshold", 0.003),
+            threshold=label_cfg.get("threshold", 0.005),
             col_close=label_cfg.get("col_close", "Close"),
         )
 
@@ -205,13 +210,11 @@ class WfaTrainer:
         # Label generation (directional 3-class, MDRS-SDE independent)
         train_slice = self._label_gen.generate(train_slice)
 
-        long_rate  = (train_slice["regime_label"] == 1).mean()
-        short_rate = (train_slice["regime_label"] == 2).mean()
+        pos_rate = train_slice["regime_label"].mean()
         logger.info(
-            "Window %s: %d train rows | long %.1f%% | short %.1f%% | flat %.1f%%",
+            "Window %s: %d train rows | breakout %.1f%% | quiet %.1f%%",
             label, len(train_slice),
-            long_rate * 100, short_rate * 100,
-            (1 - long_rate - short_rate) * 100,
+            pos_rate * 100, (1 - pos_rate) * 100,
         )
 
         # Load or train model
@@ -234,10 +237,9 @@ class WfaTrainer:
                 "label_threshold":     self._label_gen.threshold,
                 "train_rows":          len(train_slice),
                 "test_rows":           len(test_slice),
-                "long_label_rate":     round(long_rate, 4),
-                "short_label_rate":    round(short_rate, 4),
+                "positive_label_rate": round(pos_rate, 4),
             })
-            mlflow.pytorch.log_model(model, "model")
+            mlflow.pytorch.log_model(model, name="model")
 
         return WindowResult(
             window_label=label,
@@ -311,12 +313,18 @@ class WfaTrainer:
             ),
         ]
 
+        csv_logger = CSVLogger(
+            save_dir=self._default_root_dir,
+            name=window_label,
+        )
+
         trainer = Trainer(
             max_epochs=self._max_epochs,
             callbacks=callbacks,
             enable_progress_bar=True,
             enable_model_summary=True,
-            logger=True,
+            logger=csv_logger,
+            log_every_n_steps=10,
         )
         trainer.fit(model, train_loader, val_loader)
 
@@ -372,20 +380,20 @@ class WfaTrainer:
         trainer = Trainer(
             enable_progress_bar=False,
             logger=False,
+            default_root_dir=self._default_root_dir,
         )
         preds = trainer.predict(model, loader)
 
-        # preds: list of (batch, 3) tensors → (n_windows, 3)
-        prob_matrix = torch.cat(preds).numpy()
-        long_probs  = prob_matrix[:, 1]   # P(Long)
+        # preds: list of (batch,) tensors → (n_windows,)
+        probs = torch.cat(preds).numpy()
 
         # Fill full-length array: 0.5 for non-predictable positions
         full_prob     = np.full(len(test_df), 0.5, dtype=np.float32)
         valid_indices = np.where(valid_mask.values)[0]
 
-        for i, p in enumerate(long_probs):
+        for i, p in enumerate(probs):
             original_idx = valid_indices[i + self._seq_len]
-            full_prob[original_idx] = p
+            full_prob[original_idx] = float(p)
 
         return full_prob
 
