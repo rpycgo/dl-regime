@@ -119,7 +119,7 @@ class TCNRegimeModel(BaseRegimeModule):
             in_ch = out_ch
 
         self._network = nn.Sequential(*layers)
-        self._fc      = nn.Linear(in_ch, self.NUM_CLASSES)
+        self._fc = nn.Linear(in_ch, 1)
 
     def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
         """Forward pass.
@@ -128,13 +128,12 @@ class TCNRegimeModel(BaseRegimeModule):
             x: Float32 tensor ``(batch, seq_len, input_size)``.
 
         Returns:
-            Dict with ``logits`` (batch, 3) and ``regime_prob`` (batch,).
+            Dict with ``logit`` (batch,) and ``regime_prob`` (batch,).
         """
-        out    = self._network(x.permute(0, 2, 1))
-        logits = self._fc(out[:, :, -1])
-        probs  = torch.softmax(logits, dim=-1)
+        out   = self._network(x.permute(0, 2, 1))
+        logit = self._fc(out[:, :, -1]).squeeze(-1)
 
         return {
-            "logits"     : logits,
-            "regime_prob": probs[:, 1],   # P(Long)
+            "logit"      : logit,
+            "regime_prob": torch.sigmoid(logit),
         }
